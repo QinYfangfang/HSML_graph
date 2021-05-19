@@ -2,19 +2,22 @@ import torch
 from torch import nn
 from torch import optim
 from torch.nn import functional as F
-from torch.utils.data import TensorDataset, DataLoader
 from torch import optim
+from torch.nn import Parameter
 import numpy as np
 from copy import deepcopy
 
 from graph_encode.main import InfoGraph
 from learner import Learner
+from task_embedding import MEANAutoencoder
+from lstm_tree import TreeLSTM
 
 
 class Meta(nn.Module):
     def __init__(self, args, device):
         super(Meta, self).__init__()
 
+        self.args = args
         self.update_lr = args.update_lr
         self.meta_lr = args.meta_lr
         self.n_way = args.n_way
@@ -28,63 +31,94 @@ class Meta(nn.Module):
         self.graph_encoder.load_state_dict(torch.load('./graph_encode/Encoder_state_dict.pkl'))
         self.graph_encoder.to(device)
 
+        self.task_ae = MEANAutoencoder(input_size=96+11, hidden_num=args.hidden_dim)
+        self.task_ae.to(device)
+
+        self.tree = TreeLSTM(device, args)
+        self.tree.to(device)
+
         self.net = Learner().to(device)
+
+        self.task_mapping = []
+        for weight in self.net.parameters():
+            weight_size = np.prod(list(weight.size()))
+            self.task_mapping.append(nn.Sequential(
+                nn.Linear(2 * args.hidden_dim, weight_size.item()),
+                nn.Sigmoid()
+            ).to(device))
+
         self.meta_optim = optim.Adam(self.net.parameters(), lr=self.meta_lr)
+        self.net_optim = optim.Adam(
+            [{'params': self.tree.parameters()}]
+            + [{'params': self.task_mapping[i].parameters() for i in range(len(self.task_mapping))}],
+            lr=self.meta_lr)
+        self.ae_potim = optim.SGD(self.task_ae.parameters(), lr=self.meta_lr)
+
         self.loss_q = torch.tensor(0.).to(device)
         self.loss_q.requires_grad_()
 
-    def forward(self, x_spt, y_spt, x_qry, y_qry):
-        corrects = 0.
-        self.loss_q = 0.
-        origin_weight = [torch.clone(p) for p in self.net.parameters()]
+
+    def forward(self, spt, qry):
+        task_lossa, task_lossesb, task_embed_loss = [], [], []
+        task_outputa, task_outputbs = [], []
+        accs_a, accs_b = 0., 0.
 
         for i in range(self.task_num):
-            self.net.assign_weight(origin_weight)
-            logits = self.net(x_spt[i]).reshape(1, -1)
-            loss = F.cross_entropy(logits, y_spt[i][0])
-            grad = torch.autograd.grad(loss, self.net.parameters())
-            fast_weights = list(map(lambda p: p[1] - self.update_lr * p[0], zip(grad, self.net.parameters())))
+            spt_graph_embed, _ = self.graph_encoder.encoder(spt[i].x, spt[i].edge_index, spt[i].batch)
+            spt_one_hot = F.one_hot(spt[i].y.reshape(-1), num_classes=11)
+            spt_graph_embed = torch.cat((spt_graph_embed, spt_one_hot), dim=-1)
+            task_embed_vec, embed_loss = self.task_ae(spt_graph_embed)
+            task_embed_loss.append(embed_loss)
 
-            self.net.assign_weight(fast_weights)
-            logits_q = self.net(x_qry[i]).reshape(1, -1)
-            loss = F.cross_entropy(logits_q, y_qry[i][0])
-            self.loss_q = self.loss_q + loss
+            meta_knowledge_h = self.tree(task_embed_vec)
+            task_enhanced_emb_vec = torch.cat([task_embed_vec, meta_knowledge_h], dim=1)
+
+            eta = [self.task_mapping[idx](task_enhanced_emb_vec).reshape(weight.size())
+                   for idx, weight in enumerate(self.net.parameters())]
+
+            task_weights = [self.net.weights[idx] * eta[idx] for idx, weight in enumerate(self.net.parameters())]
+            task_outputa.append(self.net(spt[i], task_weights))
+            task_lossa.append(F.cross_entropy(task_outputa[-1].view(-1, 11), spt[i].y.view(-1)))
 
             with torch.no_grad():
-                pred_q = F.softmax(logits_q, dim=1).argmax(dim=1)
-                correct = torch.eq(pred_q, y_qry[i]).sum().item()
-                corrects = corrects + correct
+                preda = F.softmax(task_outputa[-1], dim=1).argmax(dim=1)
+                correct = torch.eq(preda, spt[i].y.view(-1)).sum().item()
+                accs_a += correct / preda.size(0)
 
-        self.loss_q = self.loss_q / self.task_num
-        self.meta_optim.zero_grad()
-        self.loss_q.backward(retain_graph=True)
-        '''
-        print('meta update')
-        for p in self.net.parameters()[:4]:
-            print(torch.norm(p).item())
-        '''
-        self.meta_optim.step()
-        accs = corrects / (self.task_num * x_qry[0].y.size(0))
-        return accs, self.loss_q.item()
+            grads = torch.autograd.grad(task_lossa, task_weights)
+            fast_weights = list(map(lambda p: p[1] - self.update_lr * p[0], zip(grads, task_weights)))
+            task_outputbs.append(self.net(qry[i], fast_weights))
+            task_lossesb.append(F.cross_entropy(task_outputbs[-1].view(-1, 11), qry[i].y.view(-1)))
 
-    def finetuning(self, x_spt, y_spt, x_qry, y_qry):
-        querysz = x_qry.size(0)
-        corrects = [0 for _ in range(self.update_step_test + 1)]
-        net = deepcopy(self.net)
+            with torch.no_grad():
+                predb = F.softmax(task_outputbs[-1], dim=1).argmax(dim=1)
+                correct = torch.eq(predb, qry[i].y.view(-1)).sum().item()
+                accs_b += correct / predb.size(0)
 
-        logits = self.net(x_spt)
-        loss = F.cross_entropy(logits, y_spt)
-        grad = torch.autograd.grad(loss, self.net.parameters())
-        fast_weights = list(map(lambda p: p[1] - self.update_lr * p[0], zip(grad, self.net.parameters())))
+        tot_loss1 = sum(task_lossa) / self.task_num
+        tot_loss2 = sum(task_lossesb) / self.task_num
+        tot_embed_loss = sum(task_embed_loss) / self.task_num
+        l1, l2, lb = tot_loss1.item(), tot_loss2.item(), tot_embed_loss.item()
 
-        with torch.no_grad():
-            logits_q = self.net(x_qry, fast_weights)
-            loss = F.cross_entropy(logits_q, y_qry)
-            pred_q = F.softmax(logits_q, dim=1).argmax(dim=1)
-            correct = torch.eq(pred_q, y_qry).sum().item()
-            corrects = corrects + correct
+        total_accuracy1 = accs_a / self.task_num
+        total_accuracy2 = accs_b / self.task_num
 
-        del net
-        accs = np.array(corrects) / querysz
+        if self.args.metatrain_iterations > 0:
+            # gvs = tot_loss2 + self.args.emb_loss_weight * tot_embed_loss
+            self.net_optim.zero_grad()
+            tot_loss2.backward(retain_graph=True)
+            '''
+            for p in self.task_ae.parameters():
+                print(p.grad)
+            print('\n\n')
+            raise RuntimeError
+            '''
+            self.net_optim.step()
 
-        return accs
+            self.ae_potim.zero_grad()
+            tot_embed_loss.backward()
+            nn.utils.clip_grad_norm(self.task_ae.parameters(), 2.)
+
+            self.ae_potim.step()
+
+        return total_accuracy1, total_accuracy2, l1, l2, lb

@@ -1,55 +1,56 @@
+import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
-from torch_geometric.nn import GCNConv
-from torch.nn.parameter import Parameter
-from copy import deepcopy
+from torch.nn import Parameter
+from torch_geometric.utils import get_laplacian
 
 
 class Learner(nn.Module):
     def __init__(self):
         super(Learner, self).__init__()
-
         self.weights = nn.ParameterList()
-        self.gcns = [GCNConv(1, 16, bias=False), GCNConv(16, 16, bias=False)]
-        self.weights.append(self.gcns[0].weight)
-        self.weights.append(self.gcns[1].weight)
 
-        w = nn.Parameter(torch.ones(16, 11))
-        nn.init.kaiming_normal_(w)
-        self.weights.append(w)
-        self.weights.append(nn.Parameter(torch.zeros(11)))
+        self.weights.append(Parameter(torch.Tensor(1, 16)))
+        self.weights.append(Parameter(torch.zeros(16)))
 
-        self.tmpconv1 = GCNConv(1, 16, bias=False)
-        self.tmpconv2 = GCNConv(16, 16, bias=False)
+        self.weights.append(Parameter(torch.Tensor(16, 16)))
+        self.weights.append(Parameter(torch.zeros(16)))
+
+        self.weights.append(Parameter(torch.zeros(16, 11)))
+        self.weights.append(Parameter(torch.zeros(11)))
+
+        for idx, p in enumerate(self.weights):
+            if p.dim() < 2:
+                continue
+            nn.init.kaiming_normal_(self.weights[idx])
+
+    def graphConv(self, edge_index, x, weight, bias=None):
+        edge_index, edge_weight = get_laplacian(edge_index, normalization='sym', num_nodes=x.size(0))
+        L = torch.sparse.FloatTensor(edge_index, edge_weight, torch.Size([x.size(0), x.size(0)]))
+
+        x_hat = torch.sparse.mm(L, x)
+        x_hat = x_hat @ weight
+        if bias is not None:
+            x_hat = x_hat + bias
+        return x_hat
 
     def forward(self, data, vars=None):
-        x, edge_idx = data.x, data.edge_index
-
         if vars is None:
-            x = F.relu(self.gcns[0](x, edge_idx))
-            x = F.relu(self.gcns[1](x, edge_idx))
-            x = torch.mean(x, dim=0).reshape(-1, 16)
-            x = torch.matmul(x, self.weights[2]).squeeze() + self.weights[3]
+            vars = self.weights
 
-        else:
-            self.tmpconv1.weight = Parameter(vars[0])
-            self.tmpconv2.weight = Parameter(vars[1])
+        ret = []
+        for i in range(data.y.size(0)):
+            graph = data[i]
+            x, edge_idx = graph.x, graph.edge_index
+            x = F.relu(self.graphConv(edge_idx, x, vars[0], vars[1]), inplace=False)
+            x = F.relu(self.graphConv(edge_idx, x, vars[2], vars[3]), inplace=False)
+            pooled_feature = torch.mean(x, dim=0)
+            pooled_feature = torch.matmul(pooled_feature, vars[4]).squeeze() + vars[5]
+            ret.append(pooled_feature.view(1, -1))
 
-            x = F.relu(self.tmpconv1(x, edge_idx))
-            x = F.relu(self.tmpconv2(x, edge_idx))
-            x = torch.mean(x, dim=0).reshape(-1, 16)
-            x = torch.matmul(x, vars[2]).squeeze() + vars[3]
-
-        return x
-
-    def assign_weight(self, weight):
-        self.gcns[0].weight = Parameter(torch.clone(weight[0]))
-        self.weights[0] = self.gcns[0].weight
-        self.gcns[1].weight = Parameter(torch.clone(weight[1]))
-        self.weights[1] = self.gcns[1].weight
-        self.weights[2] = Parameter(torch.clone(weight[2]))
-        self.weights[3] = Parameter(torch.clone(weight[3]))
+        re = torch.cat(ret, dim=0)
+        return re
 
     def zero_grad(self, vars=None):
         with torch.no_grad():
