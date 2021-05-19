@@ -49,10 +49,10 @@ class Meta(nn.Module):
 
         self.meta_optim = optim.Adam(self.net.parameters(), lr=self.meta_lr)
         self.net_optim = optim.Adam(
-            [{'params': self.tree.parameters()}]
+            [{'params': self.tree.parameters()}, {'params': self.task_ae.parameters()}]
             + [{'params': self.task_mapping[i].parameters() for i in range(len(self.task_mapping))}],
             lr=self.meta_lr)
-        self.ae_potim = optim.SGD(self.task_ae.parameters(), lr=self.meta_lr)
+        # self.ae_potim = optim.SGD(self.task_ae.parameters(), lr=self.meta_lr)
 
         self.loss_q = torch.tensor(0.).to(device)
         self.loss_q.requires_grad_()
@@ -62,22 +62,29 @@ class Meta(nn.Module):
         task_lossa, task_lossesb, task_embed_loss = [], [], []
         task_outputa, task_outputbs = [], []
         accs_a, accs_b = 0., 0.
+        task_weights, fast_weights = [], []
 
         for i in range(self.task_num):
             spt_graph_embed, _ = self.graph_encoder.encoder(spt[i].x, spt[i].edge_index, spt[i].batch)
             spt_one_hot = F.one_hot(spt[i].y.reshape(-1), num_classes=11)
-            spt_graph_embed = torch.cat((spt_graph_embed, spt_one_hot), dim=-1)
-            task_embed_vec, embed_loss = self.task_ae(spt_graph_embed)
+
+            spt_graph_embed_no_grad = spt_graph_embed.clone().detach()
+            spt_graph_embed_no_grad = spt_graph_embed_no_grad / 100
+
+
+            spt_graph_embed_no_grad = torch.cat((spt_graph_embed_no_grad, spt_one_hot), dim=-1)
+            task_embed_vec, embed_loss = self.task_ae(spt_graph_embed_no_grad)
             task_embed_loss.append(embed_loss)
 
-            meta_knowledge_h = self.tree(task_embed_vec)
+            meta_knowledge_h = self.tree(task_embed_vec).reshape(1, -1)
             task_enhanced_emb_vec = torch.cat([task_embed_vec, meta_knowledge_h], dim=1)
 
             eta = [self.task_mapping[idx](task_enhanced_emb_vec).reshape(weight.size())
                    for idx, weight in enumerate(self.net.parameters())]
 
-            task_weights = [self.net.weights[idx] * eta[idx] for idx, weight in enumerate(self.net.parameters())]
-            task_outputa.append(self.net(spt[i], task_weights))
+            task_weights.append([self.net.weights[idx] * eta[idx]
+                                 for idx, weight in enumerate(self.net.parameters())])
+            task_outputa.append(self.net(spt[i], task_weights[-1]))
             task_lossa.append(F.cross_entropy(task_outputa[-1].view(-1, 11), spt[i].y.view(-1)))
 
             with torch.no_grad():
@@ -85,9 +92,10 @@ class Meta(nn.Module):
                 correct = torch.eq(preda, spt[i].y.view(-1)).sum().item()
                 accs_a += correct / preda.size(0)
 
-            grads = torch.autograd.grad(task_lossa, task_weights)
-            fast_weights = list(map(lambda p: p[1] - self.update_lr * p[0], zip(grads, task_weights)))
-            task_outputbs.append(self.net(qry[i], fast_weights))
+            grads = torch.autograd.grad(task_lossa, task_weights[-1])
+            fast_weights.append(list(map(lambda p: p[1] - self.update_lr * p[0],
+                                         zip(grads, task_weights[-1]))))
+            task_outputbs.append(self.net(qry[i], fast_weights[-1]))
             task_lossesb.append(F.cross_entropy(task_outputbs[-1].view(-1, 11), qry[i].y.view(-1)))
 
             with torch.no_grad():
@@ -104,21 +112,11 @@ class Meta(nn.Module):
         total_accuracy2 = accs_b / self.task_num
 
         if self.args.metatrain_iterations > 0:
-            # gvs = tot_loss2 + self.args.emb_loss_weight * tot_embed_loss
+            gvs = tot_loss2 + self.args.emb_loss_weight * tot_embed_loss
             self.net_optim.zero_grad()
-            tot_loss2.backward(retain_graph=True)
-            '''
-            for p in self.task_ae.parameters():
-                print(p.grad)
-            print('\n\n')
-            raise RuntimeError
-            '''
+            gvs.backward(retain_graph=True)
+
             self.net_optim.step()
 
-            self.ae_potim.zero_grad()
-            tot_embed_loss.backward()
-            nn.utils.clip_grad_norm(self.task_ae.parameters(), 2.)
-
-            self.ae_potim.step()
 
         return total_accuracy1, total_accuracy2, l1, l2, lb

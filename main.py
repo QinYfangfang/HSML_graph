@@ -6,15 +6,10 @@ from preprocess import Reddit12k, MetaLoader, BatchLoader
 from meta import Meta
 
 
-
-
 def main(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = Meta(args, device)
     dataset = {i: Reddit12k(device, i) for i in range(11)}
-
-    spt_loader = BatchLoader(dataset, args.k_spt, batch_size=args.task_num)
-    qry_loader = BatchLoader(dataset, args.k_qry, batch_size=args.task_num)
 
     for step in range(args.epoch):
         spt_loader = BatchLoader(dataset, args.k_spt, batch_size=args.task_num)

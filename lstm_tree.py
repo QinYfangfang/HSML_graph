@@ -73,4 +73,3 @@ class TreeLSTM(nn.Module):
 
         root_c = torch.sum(torch.cat(root_c, dim=0), dim=0)
         return root_c
-

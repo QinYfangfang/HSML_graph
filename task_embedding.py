@@ -18,7 +18,8 @@ class MEANAutoencoder(nn.Module):
         self.decoder = nn.Sequential(
             nn.Linear(self.hidden_num, self.hidden_num_mid),
             nn.ReLU(),
-            nn.Linear(self.hidden_num_mid, self.input_size)
+            nn.Linear(self.hidden_num_mid, self.input_size),
+            nn.ReLU()
         )
         self.last_fc = nn.Linear(self.hidden_num, self.hidden_num)
 
