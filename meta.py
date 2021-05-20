@@ -1,16 +1,13 @@
 import torch
 from torch import nn
-from torch import optim
 from torch.nn import functional as F
 from torch import optim
-from torch.nn import Parameter
 import numpy as np
-from copy import deepcopy
 
-from graph_encode.main import InfoGraph
 from learner import Learner
 from task_embedding import MEANAutoencoder
 from lstm_tree import TreeLSTM
+from graph_encoder import GraphEncoder
 
 
 class Meta(nn.Module):
@@ -27,16 +24,9 @@ class Meta(nn.Module):
         self.update_step = args.update_step
         self.update_step_test = args.update_step_test
 
-        self.graph_encoder = InfoGraph()
-        self.graph_encoder.load_state_dict(torch.load('./graph_encode/Encoder_state_dict.pkl'))
-        self.graph_encoder.to(device)
-
-        self.task_ae = MEANAutoencoder(input_size=96+11, hidden_num=args.hidden_dim)
-        self.task_ae.to(device)
-
-        self.tree = TreeLSTM(device, args)
-        self.tree.to(device)
-
+        self.graph_embed = GraphEncoder().to(device)
+        self.task_ae = MEANAutoencoder(input_size=64+11, hidden_num=args.hidden_dim).to(device)
+        self.tree = TreeLSTM(device, args).to(device)
         self.net = Learner().to(device)
 
         self.task_mapping = []
@@ -44,19 +34,17 @@ class Meta(nn.Module):
             weight_size = np.prod(list(weight.size()))
             self.task_mapping.append(nn.Sequential(
                 nn.Linear(2 * args.hidden_dim, weight_size.item()),
-                nn.Sigmoid()
+                nn.LeakyReLU()
             ).to(device))
 
-        self.meta_optim = optim.Adam(self.net.parameters(), lr=self.meta_lr)
         self.net_optim = optim.Adam(
-            [{'params': self.tree.parameters()}, {'params': self.task_ae.parameters()}]
-            + [{'params': self.task_mapping[i].parameters() for i in range(len(self.task_mapping))}],
+            [{'params': self.tree.parameters()}, {'params': self.task_ae.parameters(), 'lr': 1e-4}]
+            + [{'params': self.task_mapping[i].parameters() for i in range(len(self.task_mapping))}]
+            + [{'params': self.graph_embed.parameters()}, {'params': self.net.parameters()}],
             lr=self.meta_lr)
-        # self.ae_potim = optim.SGD(self.task_ae.parameters(), lr=self.meta_lr)
 
         self.loss_q = torch.tensor(0.).to(device)
         self.loss_q.requires_grad_()
-
 
     def forward(self, spt, qry):
         task_lossa, task_lossesb, task_embed_loss = [], [], []
@@ -65,15 +53,11 @@ class Meta(nn.Module):
         task_weights, fast_weights = [], []
 
         for i in range(self.task_num):
-            spt_graph_embed, _ = self.graph_encoder.encoder(spt[i].x, spt[i].edge_index, spt[i].batch)
+            spt_graph_embed = self.graph_embed(spt[i].x, spt[i].edge_index, spt[i].batch)
             spt_one_hot = F.one_hot(spt[i].y.reshape(-1), num_classes=11)
 
-            spt_graph_embed_no_grad = spt_graph_embed.clone().detach()
-            spt_graph_embed_no_grad = spt_graph_embed_no_grad / 100
-
-
-            spt_graph_embed_no_grad = torch.cat((spt_graph_embed_no_grad, spt_one_hot), dim=-1)
-            task_embed_vec, embed_loss = self.task_ae(spt_graph_embed_no_grad)
+            spt_graph_embed = torch.cat((spt_graph_embed, spt_one_hot), dim=-1)
+            task_embed_vec, embed_loss = self.task_ae(spt_graph_embed)
             task_embed_loss.append(embed_loss)
 
             meta_knowledge_h = self.tree(task_embed_vec).reshape(1, -1)
@@ -111,12 +95,12 @@ class Meta(nn.Module):
         total_accuracy1 = accs_a / self.task_num
         total_accuracy2 = accs_b / self.task_num
 
+
         if self.args.metatrain_iterations > 0:
             gvs = tot_loss2 + self.args.emb_loss_weight * tot_embed_loss
             self.net_optim.zero_grad()
-            gvs.backward(retain_graph=True)
-
+            gvs.backward()
+            nn.utils.clip_grad_norm(self.parameters(), 5.)
             self.net_optim.step()
-
 
         return total_accuracy1, total_accuracy2, l1, l2, lb

@@ -10,20 +10,33 @@ def main(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = Meta(args, device)
     dataset = {i: Reddit12k(device, i) for i in range(11)}
-
+    reses = ['epoch', 'acc_tr', 'acc_te', 'loss_tr', 'loss_te', 'embed_loss']
+    res_dict = {st: [] for st in reses}
     for step in range(args.epoch):
         spt_loader = BatchLoader(dataset, args.k_spt, batch_size=args.task_num)
         qry_loader = BatchLoader(dataset, args.k_qry, batch_size=args.task_num)
+        epoch_res = []
         while True:
             try:
                 spt_batch = spt_loader.next()
                 qry_batch = qry_loader.next()
-                acc_tr, acc_te, loss_tr, loss_te, embed_loss = model(spt_batch, qry_batch)
+                res = model(spt_batch, qry_batch)
+                epoch_res.append(res)
             except StopIteration:
                 break
         if step % 50 == 0:
-            print(f'Step: {step}, acc_tr: {acc_tr}, acc_te: {acc_te},' +
-                  f' loss_tr: {loss_tr}, loss_te: {loss_te}, embed_loss: {embed_loss}')
+            res_dict['epoch'].append(step)
+            for idx, key in enumerate(res_dict.keys()):
+                if not idx:
+                    continue
+                res_dict[key].append(0.)
+                for item in epoch_res:
+                    res_dict[key][-1] += item[idx-1]
+                res_dict[key][-1] /= len(epoch_res)
+            print(f'Epoch {step}:')
+            print('\tTrain_acc: {}, Test_acc: {}'.format(res_dict['acc_tr'][-1], res_dict['acc_te'][-1]))
+            print('\tTrain_loss: {}, Test_loss: {}, Embed_loss: {}'.format(
+                res_dict['loss_tr'][-1], res_dict['loss_te'][-1], res_dict['embed_loss'][-1]))
 
 
 if __name__ == '__main__':
@@ -34,7 +47,7 @@ if __name__ == '__main__':
     argparser.add_argument('--k_spt', type=int, help='k shot for support set', default=1)
     argparser.add_argument('--k_qry', type=int, help='k shot for query set', default=5)
     argparser.add_argument('--task_num', type=int, help='meta batch size, namely task num', default=10)
-    argparser.add_argument('--meta_lr', type=float, help='meta-level outer learning rate', default=1e-4)
+    argparser.add_argument('--meta_lr', type=float, help='meta-level outer learning rate', default=1e-3)
     argparser.add_argument('--update_lr', type=float, help='task-level inner update learning rate', default=0.4)
     argparser.add_argument('--update_step', type=int, help='task-level inner update steps', default=1)
     argparser.add_argument('--update_step_test', type=int, help='update steps for finetunning', default=10)

@@ -27,6 +27,11 @@ class TreeLSTM(nn.Module):
         for i in range(args.cluster_layer_0):
             self.cluster_center.append(Variable(torch.randn(size=(1, self.input_dim))).to(device))
 
+        for p in self.parameters():
+            if p.dim() < 2:
+                continue
+            nn.init.kaiming_normal_(p)
+
     def forward(self, inputs):
         sigma = 2.0
         for idx in range(self.cluster_layer_0):
