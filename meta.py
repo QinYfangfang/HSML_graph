@@ -38,7 +38,7 @@ class Meta(nn.Module):
             ).to(device))
 
         self.net_optim = optim.Adam(
-            [{'params': self.tree.parameters()}, {'params': self.task_ae.parameters(), 'lr': 1e-4}]
+            [{'params': self.tree.parameters()}, {'params': self.task_ae.parameters(), 'lr': 1e-3}]
             + [{'params': self.task_mapping[i].parameters() for i in range(len(self.task_mapping))}]
             + [{'params': self.graph_embed.parameters()}, {'params': self.net.parameters()}],
             lr=self.meta_lr)
@@ -46,7 +46,7 @@ class Meta(nn.Module):
         self.loss_q = torch.tensor(0.).to(device)
         self.loss_q.requires_grad_()
 
-    def forward(self, spt, qry):
+    def forward(self, spt, qry, train=True):
         task_lossa, task_lossesb, task_embed_loss = [], [], []
         task_outputa, task_outputbs = [], []
         accs_a, accs_b = 0., 0.
@@ -95,12 +95,20 @@ class Meta(nn.Module):
         total_accuracy1 = accs_a / self.task_num
         total_accuracy2 = accs_b / self.task_num
 
+        if not train:
+            return total_accuracy1, total_accuracy2, l1, l2, lb
 
         if self.args.metatrain_iterations > 0:
             gvs = tot_loss2 + self.args.emb_loss_weight * tot_embed_loss
             self.net_optim.zero_grad()
             gvs.backward()
-            nn.utils.clip_grad_norm(self.parameters(), 5.)
+            nn.utils.clip_grad_norm_(self.parameters(), 5.)
+            nn.utils.clip_grad_norm_(self.net.parameters(), 5.)
+            nn.utils.clip_grad_norm_(self.task_ae.parameters(), 5.)
+            nn.utils.clip_grad_norm_(self.tree.parameters(), 5.)
+            for _ in range(len(self.task_mapping)):
+                for p in self.task_mapping[_]:
+                    nn.utils.clip_grad_norm_(p.parameters(), 5.)
             self.net_optim.step()
 
         return total_accuracy1, total_accuracy2, l1, l2, lb

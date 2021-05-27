@@ -102,12 +102,13 @@ def generate(path='./data/Reddit12k/Reddit.txt'):
 
 
 class BatchLoader:
-    def __init__(self, datadict, k, batch_size=25, n_ways=11):
+    def __init__(self, datadict, k, classes, batch_size=25, n_ways=11):
         self.k = k
         self.n_ways = n_ways
         self.batch_size = batch_size
-        self.loader = {i: DataLoader(datadict[i], batch_size=k, shuffle=True) for i in datadict}
+        self.loader = {i: DataLoader(datadict[i-1], batch_size=k, shuffle=True) for i in classes}
         self.iter = {i: iter(self.loader[i]) for i in self.loader}
+        self.classes = classes
 
     def next(self):
         ret = []
